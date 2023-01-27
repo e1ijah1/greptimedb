@@ -33,7 +33,8 @@ use tokio::sync::Mutex;
 
 use crate::error::{
     CatalogNotFoundSnafu, CreateTableSnafu, InvalidCatalogValueSnafu, InvalidTableSchemaSnafu,
-    OpenTableSnafu, Result, SchemaNotFoundSnafu, TableExistsSnafu, UnimplementedSnafu,
+    OpenTableSnafu, Result, SchemaNotFoundSnafu, TableExistsSnafu, TableNotFoundSnafu,
+    UnimplementedSnafu,
 };
 use crate::helper::{
     build_catalog_prefix, build_schema_prefix, build_table_global_prefix, CatalogKey, CatalogValue,
@@ -449,11 +450,21 @@ impl CatalogManager for RemoteCatalogManager {
         Ok(true)
     }
 
-    async fn rename_table(&self, _request: RenameTableRequest) -> Result<bool> {
-        UnimplementedSnafu {
-            operation: "rename table",
-        }
-        .fail()
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<bool> {
+        let catalog_name = request.catalog;
+        let schema_name = request.schema;
+        let catalog_provider = self.catalog(&catalog_name)?.context(CatalogNotFoundSnafu {
+            catalog_name: &catalog_name,
+        })?;
+        let schema_provider =
+            catalog_provider
+                .schema(&schema_name)?
+                .with_context(|| SchemaNotFoundSnafu {
+                    catalog: &catalog_name,
+                    schema: &schema_name,
+                })?;
+        schema_provider.rename_table(&request.table_name, request.new_table_name)?;
+        Ok(true)
     }
 
     async fn register_system_table(&self, request: RegisterSystemTableRequest) -> Result<()> {
@@ -746,11 +757,49 @@ impl SchemaProvider for RemoteSchemaProvider {
         prev
     }
 
-    fn rename_table(&self, _name: &str, _new_name: String) -> Result<TableRef> {
-        UnimplementedSnafu {
-            operation: "rename table",
-        }
-        .fail()
+    fn rename_table(&self, name: &str, new_name: String) -> Result<TableRef> {
+        let table = self.table(name)?.context(TableNotFoundSnafu {
+            table_info: name.to_string(),
+        })?;
+        let table_info = table.table_info();
+        let table_value = TableRegionalValue {
+            version: table_info.ident.version,
+            regions_ids: table_info.meta.region_numbers.clone(),
+        };
+        let backend = self.backend.clone();
+        let mutex = self.mutex.clone();
+        let tables = self.tables.clone();
+        let table_key = self.build_regional_table_key(name).to_string();
+        let new_table_key = self.build_regional_table_key(&new_name).to_string();
+        let old_table_name = name.to_string();
+
+        let table_ref = std::thread::spawn(move || {
+            common_runtime::block_on_read(async move {
+                let _guard = mutex.lock().await;
+                backend.delete(table_key.as_bytes()).await?;
+                backend
+                    .set(
+                        new_table_key.as_bytes(),
+                        &table_value.as_bytes().context(InvalidCatalogValueSnafu)?,
+                    )
+                    .await?;
+                debug!(
+                    "Successfully set catalog table entry, key: {}, table value: {:?}",
+                    table_key, table_value
+                );
+
+                let prev_tables = tables.load();
+                let mut new_tables = HashMap::with_capacity(prev_tables.len());
+                new_tables.clone_from(&prev_tables);
+                let table_ref = new_tables.remove(&old_table_name).unwrap();
+                new_tables.insert(new_name, table);
+                tables.store(Arc::new(new_tables));
+                Ok(table_ref)
+            })
+        })
+        .join()
+        .unwrap();
+        table_ref
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<TableRef>> {
